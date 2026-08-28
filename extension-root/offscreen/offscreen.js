@@ -12,7 +12,7 @@ async function initializeSession() {
     try {
         console.log('[offscreen] Initializing ONNX inference session...');
         const options = { executionProviders: ['wasm'] };
-        session = await ort.InferenceSession.create('../assets/model.onnx', options);
+        session = await ort.InferenceSession.create('../assets/mobilenetv2-7-quantized.onnx', options);
         console.log('[offscreen] Model ready. Input names:', session.inputNames, 'Output names:', session.outputNames);
     } catch (err) {
         console.error('[offscreen] Failed to initialize inference session:', err);
@@ -89,19 +89,36 @@ function preprocessPixels(imgData) {
 }
 
 /**
- * Finds the highest confidence score in a model output tensor.
+ * Applies softmax over all logits in the output tensor and returns the
+ * highest class probability scaled to a 0–100 percentage.
+ *
+ * Using raw logits as a confidence score is incorrect because their magnitude
+ * is unbounded and not comparable to the percentage thresholds used in the
+ * traffic-light UI (< 40 = red, ≤ 75 = orange, > 75 = green).
+ *
  * @param {ort.Tensor} outputTensor
- * @returns {number}
+ * @returns {number} Confidence percentage in [0, 100]
  */
-function extractHighestConfidence(outputTensor) {
+function extractSoftmaxConfidence(outputTensor) {
     const data = outputTensor.data;
-    let highest = -Infinity;
-    for (let i = 0; i < data.length; i++) {
-        if (data[i] > highest) {
-            highest = data[i];
-        }
+    const len  = data.length;
+
+    // Numerically stable softmax: subtract max before exp.
+    let maxLogit = -Infinity;
+    for (let i = 0; i < len; i++) {
+        if (data[i] > maxLogit) maxLogit = data[i];
     }
-    return highest;
+
+    let sumExp = 0;
+    let maxExp = 0;
+    for (let i = 0; i < len; i++) {
+        const e = Math.exp(data[i] - maxLogit);
+        sumExp += e;
+        if (e > maxExp) maxExp = e;
+    }
+
+    // Highest softmax probability → scale to [0, 100]
+    return (maxExp / sumExp) * 100;
 }
 
 /**
@@ -133,7 +150,7 @@ async function processFrame(payload, targetTabId) {
 
         const outputName = session.outputNames && session.outputNames[0] ? session.outputNames[0] : Object.keys(outputMap)[0];
         const outputTensor = outputMap[outputName];
-        const highestConfidenceScore = extractHighestConfidence(outputTensor);
+        const highestConfidenceScore = extractSoftmaxConfidence(outputTensor);
 
         chrome.runtime.sendMessage({
             type: 'INFERENCE_RESULT',
