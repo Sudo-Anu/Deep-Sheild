@@ -21,7 +21,7 @@ async function setupOffscreenDocument(path) {
 
         await chrome.offscreen.createDocument({
             url: path,
-            reasons: [chrome.offscreen.Reason.DOM_PARSER],
+            reasons: [chrome.offscreen.Reason.BLOBS],
             justification:
                 'Executing local ONNX neural network inference via WebAssembly.'
         });
