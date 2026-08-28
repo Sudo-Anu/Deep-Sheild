@@ -38,9 +38,10 @@ function decodeFrameToPixels(dataUrl) {
 
             img.onload = () => {
                 try {
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                    ctx.clearRect(0, 0, 224, 224);
+                    ctx.drawImage(img, 0, 0, 224, 224);
+                    // Preprocess raw canvas pixels [224x224 RGB] into standard ImageNet format
+                    const imgData = ctx.getImageData(0, 0, 224, 224).data;
                     resolve(imgData);
                 } catch (drawErr) {
                     reject(drawErr);
@@ -65,24 +66,23 @@ function decodeFrameToPixels(dataUrl) {
  * @returns {Float32Array}
  */
 function preprocessPixels(imgData) {
-    const width = 224;
-    const height = 224;
-    const numPixels = width * height;
+    const numPixels = 224 * 224;
     const processedData = new Float32Array(3 * numPixels);
 
-    // ImageNet mean/std normalization, applied per channel.
+    // ImageNet normalization constants
     const mean = [0.485, 0.456, 0.406];
-    const std = [0.229, 0.224, 0.225];
+    const std  = [0.229, 0.224, 0.225];
 
     for (let i = 0; i < numPixels; i++) {
-        const offset = i * 4; // RGBA stride in source data
-        const r = imgData[offset] / 255;
-        const g = imgData[offset + 1] / 255;
-        const b = imgData[offset + 2] / 255;
+      // Extract RGB channels (ignoring Alpha at index i * 4 + 3)
+      const r = imgData[i * 4] / 255.0;
+      const g = imgData[i * 4 + 1] / 255.0;
+      const b = imgData[i * 4 + 2] / 255.0;
 
-        processedData[i] = (r - mean[0]) / std[0];                  // R plane
-        processedData[numPixels + i] = (g - mean[1]) / std[1];      // G plane
-        processedData[2 * numPixels + i] = (b - mean[2]) / std[2];  // B plane
+      // Planar Layout format (All Red channels, then Green, then Blue)
+      processedData[i]               = (r - mean[0]) / std[0]; // Red
+      processedData[i + numPixels]     = (g - mean[1]) / std[1]; // Green
+      processedData[i + 2 * numPixels] = (b - mean[2]) / std[2]; // Blue
     }
 
     return processedData;
@@ -125,6 +125,7 @@ async function processFrame(payload, targetTabId) {
         const imgData = await decodeFrameToPixels(payload);
         const processedData = preprocessPixels(imgData);
 
+        // Wrap in the ONNX input tensor
         inputTensor = new ort.Tensor('float32', processedData, [1, 3, 224, 224]);
 
         const inputName = session.inputNames && session.inputNames[0] ? session.inputNames[0] : 'input';
