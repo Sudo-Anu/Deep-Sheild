@@ -31,7 +31,7 @@
         {
             "resources": [
                 "lib/ort-wasm.wasm",
-                "assets/model.onnx"
+                "assets/mobilenetv2-7-quantized.onnx"
             ],
             "matches": [
                 "<all_urls>"
