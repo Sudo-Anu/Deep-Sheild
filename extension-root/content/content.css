@@ -1,0 +1,93 @@
+/* content/content.css */
+
+#ai-confidence-indicator {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+
+    z-index: 999999;
+
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+
+    padding: 12px;
+
+    background: rgba(30, 30, 30, 0.85);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 12px;
+
+    box-shadow:
+        0 8px 24px rgba(0, 0, 0, 0.35),
+        0 2px 8px rgba(0, 0, 0, 0.2);
+
+    pointer-events: none;
+    user-select: none;
+}
+
+#ai-confidence-indicator .confidence-light {
+    width: 16px;
+    height: 16px;
+
+    flex: 0 0 16px;
+
+    border-radius: 50%;
+
+    opacity: 0.25;
+    transform: scale(0.9);
+
+    transition:
+        opacity 0.3s ease,
+        transform 0.3s ease,
+        box-shadow 0.3s ease;
+}
+
+/* Unlit states */
+
+#ai-confidence-indicator .confidence-light.red {
+    background: rgba(231, 76, 60, 0.25);
+}
+
+#ai-confidence-indicator .confidence-light.orange {
+    background: rgba(241, 196, 15, 0.25);
+}
+
+#ai-confidence-indicator .confidence-light.green {
+    background: rgba(46, 204, 113, 0.25);
+}
+
+/* Active states */
+
+#ai-confidence-indicator .confidence-light.red.active {
+    background: rgba(231, 76, 60, 1);
+    opacity: 1;
+    transform: scale(1);
+
+    box-shadow:
+        0 0 6px rgba(231, 76, 60, 0.8),
+        0 0 14px rgba(231, 76, 60, 0.45);
+}
+
+#ai-confidence-indicator .confidence-light.orange.active {
+    background: rgba(241, 196, 15, 1);
+    opacity: 1;
+    transform: scale(1);
+
+    box-shadow:
+        0 0 6px rgba(241, 196, 15, 0.8),
+        0 0 14px rgba(241, 196, 15, 0.45);
+}
+
+#ai-confidence-indicator .confidence-light.green.active {
+    background: rgba(46, 204, 113, 1);
+    opacity: 1;
+    transform: scale(1);
+
+    box-shadow:
+        0 0 6px rgba(46, 204, 113, 0.8),
+        0 0 14px rgba(46, 204, 113, 0.45);
+}
