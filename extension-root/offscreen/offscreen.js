@@ -2,6 +2,21 @@
 // Runs inside the Offscreen Document context. Manages the local ONNX
 // inference session lifecycle and processes forwarded video frames.
 
+// ---------------------------------------------------------------------------
+// ONNX Runtime WASM Configuration
+// Force single-threaded CPU fallback to prevent the loader from attempting
+// to fetch unavailable SIMD/multi-threaded variants (e.g. ort-wasm-simd-threaded.jsep.mjs).
+// ---------------------------------------------------------------------------
+
+// 1. Force ONNX Runtime to disable advanced features that require extra files
+ort.env.wasm.numThreads = 1;
+ort.env.wasm.simd = false;
+
+// 2. Map the file loading path strictly to your local, single-threaded binary
+ort.env.wasm.wasmPaths = {
+    'ort-wasm.wasm': '../lib/ort-wasm.wasm'
+};
+
 let session = null;
 
 /**
