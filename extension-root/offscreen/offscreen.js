@@ -3,19 +3,22 @@
 // inference session lifecycle and processes forwarded video frames.
 
 // ---------------------------------------------------------------------------
-// ONNX Runtime WASM Configuration
-// Force single-threaded CPU fallback to prevent the loader from attempting
-// to fetch unavailable SIMD/multi-threaded variants (e.g. ort-wasm-simd-threaded.jsep.mjs).
+// ONNX Runtime WASM Configuration (v1.29.0)
+//
+// ORT 1.29.0 unconditionally runs a dynamic import() of the .jsep.mjs
+// bootstrap before reading env flags. We must:
+//   1. Point ALL asset lookups (both .wasm and .mjs) to our local lib/ folder
+//      using the string-prefix form of wasmPaths (object form only intercepts
+//      .wasm fetches, not ES module dynamic imports).
+//   2. Keep numThreads = 1 so only the simd-threaded variant is attempted
+//      (not a multi-threaded pool), which is the file we have locally.
 // ---------------------------------------------------------------------------
 
-// 1. Force ONNX Runtime to disable advanced features that require extra files
-ort.env.wasm.numThreads = 1;
-ort.env.wasm.simd = false;
+// 1. Redirect ALL ORT asset lookups to local lib/ (covers .wasm AND .mjs files)
+ort.env.wasm.wasmPaths = '../lib/';
 
-// 2. Map the file loading path strictly to your local, single-threaded binary
-ort.env.wasm.wasmPaths = {
-    'ort-wasm.wasm': '../lib/ort-wasm.wasm'
-};
+// 2. Single inference thread — prevents worker-pool spawning
+ort.env.wasm.numThreads = 1;
 
 let session = null;
 
