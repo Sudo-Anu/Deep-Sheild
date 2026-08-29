@@ -1,6 +1,15 @@
 const OFFSCREEN_DOCUMENT_PATH = 'offscreen/offscreen.html';
 
 /**
+ * Storage key helper — namespaces per-tab state in chrome.storage.session.
+ * @param {number} tabId
+ * @returns {string}
+ */
+function tabKey(tabId) {
+    return `tab_state_${tabId}`;
+}
+
+/**
  * Ensures that the required Offscreen Document is active.
  *
  * @param {string} path - Relative path to the offscreen HTML document.
@@ -21,7 +30,7 @@ async function setupOffscreenDocument(path) {
 
         await chrome.offscreen.createDocument({
             url: path,
-            reasons: [chrome.offscreen.Reason.BLOBS],
+            reasons: [chrome.offscreen.Reason.WORKERS],
             justification:
                 'Executing local ONNX neural network inference via WebAssembly.'
         });
@@ -47,67 +56,93 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     console.log('[Background] Message received:', message);
 
     /**
-     * Node A: Frame Capture
+     * Node A: Tab Screenshot Capture
      *
-     * Content Script -> Background -> Offscreen Document
+     * Content Script sends the video's bounding rect.
+     * Background screenshots the tab with captureVisibleTab() — this works on
+     * ANY video regardless of origin (file://, cross-origin, DRM) because it
+     * captures rendered screen pixels, not the video element directly.
      */
-    if (message?.type === 'FRAME_DATA') {
+    if (message?.type === 'REQUEST_TAB_CAPTURE') {
         const originatingTabId = sender?.tab?.id;
+        const { rect } = message;
 
         if (typeof originatingTabId !== 'number') {
-            console.error(
-                '[Background] FRAME_DATA rejected: sender tab ID is unavailable.'
-            );
-
-            sendResponse({
-                success: false,
-                error: 'Originating tab ID is unavailable.'
-            });
-
+            console.error('[Background] REQUEST_TAB_CAPTURE rejected: sender tab ID unavailable.');
+            sendResponse({ success: false, error: 'Tab ID unavailable.' });
             return true;
         }
 
-        console.log(
-            `[Background] FRAME_DATA received from tab ${originatingTabId}.`
-        );
+        console.log(`[Background] REQUEST_TAB_CAPTURE from tab ${originatingTabId}, rect:`, rect);
 
         (async () => {
             try {
-                // Ensure the inference engine's Offscreen Document is running.
                 await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
 
-                console.log(
-                    `[Background] Forwarding FRAME_DATA from tab ${originatingTabId} to Offscreen Document...`
+                // captureVisibleTab screenshots the ACTIVE tab at device resolution.
+                // No canvas/CORS restrictions apply — works on any video source.
+                const screenshotDataUrl = await chrome.tabs.captureVisibleTab(
+                    null, // current window
+                    { format: 'jpeg', quality: 70 }
                 );
 
                 await chrome.runtime.sendMessage({
-                    type: 'PROCESS_FRAME',
-                    payload: message.payload,
+                    type: 'PROCESS_SCREENSHOT',
+                    payload: screenshotDataUrl,
+                    rect,                        // video bounding rect (CSS px + DPR)
                     targetTabId: originatingTabId
                 });
 
-                console.log(
-                    `[Background] FRAME_DATA successfully forwarded for tab ${originatingTabId}.`
-                );
-
-                sendResponse({
-                    success: true
-                });
+                sendResponse({ success: true });
             } catch (error) {
-                console.error(
-                    `[Background] Failed to forward FRAME_DATA for tab ${originatingTabId}:`,
-                    error
-                );
-
-                sendResponse({
-                    success: false,
-                    error: error instanceof Error ? error.message : String(error)
-                });
+                console.error(`[Background] Tab capture failed for tab ${originatingTabId}:`, error);
+                sendResponse({ success: false, error: error.message });
             }
         })();
 
-        // Keep the message channel open for the asynchronous response.
-        return true;
+        return true; // async response
+    }
+
+    /**
+     * Node P: Popup Status Query
+     *
+     * Popup -> Background: returns cached confidence for the requested tab.
+     */
+    if (message?.type === 'GET_STATUS') {
+        const { tabId } = message;
+        const key = tabKey(tabId);
+        chrome.storage.session.get([key], (result) => {
+            sendResponse({ state: result[key] ?? null });
+        });
+        return true; // async response
+    }
+
+    /**
+     * Node C: Content script reports no video found on this tab.
+     */
+    if (message?.type === 'NO_VIDEO') {
+        const tabId = sender?.tab?.id;
+        if (typeof tabId === 'number') {
+            const key = tabKey(tabId);
+            // Only overwrite if there's no real confidence result yet.
+            chrome.storage.session.get([key], (result) => {
+                if (!result[key]?.confidence) {
+                    chrome.storage.session.set({ [key]: { status: 'no_video' } });
+                }
+            });
+        }
+        return false;
+    }
+
+    /**
+     * Node D: Content script reports canvas cross-origin taint.
+     */
+    if (message?.type === 'CANVAS_TAINTED') {
+        const tabId = sender?.tab?.id;
+        if (typeof tabId === 'number') {
+            chrome.storage.session.set({ [tabKey(tabId)]: { status: 'tainted' } });
+        }
+        return false;
     }
 
     /**
@@ -117,6 +152,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
      */
     if (message?.type === 'INFERENCE_RESULT') {
         const { confidence, targetTabId } = message;
+
+        // Persist result so popup reads it even after SW restart.
+        chrome.storage.session.set({ [tabKey(targetTabId)]: { confidence } });
 
         console.log(
             `[Background] INFERENCE_RESULT received for tab ${targetTabId}. Confidence: ${confidence}`

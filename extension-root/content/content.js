@@ -11,20 +11,6 @@
     const CANVAS_SIZE = 224;
 
     // ============================================================
-    // Global Canvas
-    // Created once and reused for every frame.
-    // ============================================================
-
-    const canvas = document.createElement("canvas");
-    canvas.width = CANVAS_SIZE;
-    canvas.height = CANVAS_SIZE;
-
-    const ctx = canvas.getContext("2d", {
-        alpha: false,
-        willReadFrequently: false
-    });
-
-    // ============================================================
     // Traffic Light UI
     // ============================================================
 
@@ -37,82 +23,9 @@
         <div class="confidence-light green" data-level="green"></div>
     `;
 
-    const style = document.createElement("style");
-
-    style.textContent = `
-        #ai-confidence-indicator {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            z-index: 2147483647;
-
-            display: flex;
-            align-items: center;
-            gap: 8px;
-
-            padding: 8px 10px;
-
-            background: rgba(20, 20, 20, 0.85);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 12px;
-
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
-
-            box-shadow:
-                0 4px 20px rgba(0, 0, 0, 0.25);
-
-            pointer-events: none;
-            user-select: none;
-        }
-
-        .confidence-light {
-            width: 14px;
-            height: 14px;
-
-            border-radius: 50%;
-
-            opacity: 0.2;
-            transform: scale(0.85);
-
-            transition:
-                opacity 250ms ease,
-                transform 250ms ease,
-                box-shadow 250ms ease;
-        }
-
-        .confidence-light.red {
-            background: #ff3b30;
-        }
-
-        .confidence-light.orange {
-            background: #ff9500;
-        }
-
-        .confidence-light.green {
-            background: #34c759;
-        }
-
-        .confidence-light.active {
-            opacity: 1;
-            transform: scale(1.15);
-        }
-
-        .confidence-light.red.active {
-            box-shadow: 0 0 12px rgba(255, 59, 48, 0.8);
-        }
-
-        .confidence-light.orange.active {
-            box-shadow: 0 0 12px rgba(255, 149, 0, 0.8);
-        }
-
-        .confidence-light.green.active {
-            box-shadow: 0 0 12px rgba(52, 199, 89, 0.8);
-        }
-    `;
-
-    // Inject UI styles and indicator.
-    document.documentElement.appendChild(style);
+    // Styles are defined in content.css (injected via manifest content_scripts).
+    // Do NOT add duplicate inline styles here — content.css wins and the
+    // duplicate caused a flex-direction conflict (column vs row).
     document.body?.appendChild(indicator);
 
     // Handle pages where body is not available immediately.
@@ -162,97 +75,113 @@
     // ============================================================
 
     function isVideoVisible(video) {
-        if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        if (!video) return false;
+
+        // Accept any video that has at least metadata (dimensions known).
+        // HAVE_CURRENT_DATA (2) is ideal but HAVE_METADATA (1) allows paused frames.
+        if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
             return false;
         }
 
-        if (video.paused || video.ended) {
-            return false;
-        }
-
-        if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+        // Reject only fully ended videos — paused is OK for deepfake analysis.
+        if (video.ended) {
             return false;
         }
 
         const rect = video.getBoundingClientRect();
 
-        if (
-            rect.width <= 0 ||
-            rect.height <= 0
-        ) {
+        // Must have non-zero rendered dimensions.
+        if (rect.width <= 0 || rect.height <= 0) {
             return false;
         }
 
-        // Ensure the video is inside the viewport.
-        const viewportWidth = window.innerWidth;
-        const viewportHeight = window.innerHeight;
+        // Must overlap the viewport at least partially.
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
 
-        const horizontallyVisible =
-            rect.right > 0 &&
-            rect.left < viewportWidth;
+        const inViewport =
+            rect.right > 0 && rect.left < vw &&
+            rect.bottom > 0 && rect.top < vh;
 
-        const verticallyVisible =
-            rect.bottom > 0 &&
-            rect.top < viewportHeight;
-
-        if (!horizontallyVisible || !verticallyVisible) {
-            return false;
-        }
-
-        // Require the center point to be inside the viewport.
-        const centerX = rect.left + rect.width / 2;
-        const centerY = rect.top + rect.height / 2;
-
-        if (
-            centerX < 0 ||
-            centerX > viewportWidth ||
-            centerY < 0 ||
-            centerY > viewportHeight
-        ) {
-            return false;
-        }
-
-        return true;
+        return inViewport;
     }
 
     // ============================================================
     // Frame Capture
     // ============================================================
 
-    function captureFrame() {
-        const video = findTargetVideo();
+    // Capture loop interval reference — kept in outer scope so captureFrame
+    // can clear it when it detects the extension context has been invalidated.
+    let captureInterval = null;
 
-        if (!video) {
+    /**
+     * Sends a message to the background, self-terminating if the extension
+     * context has been invalidated (i.e. the extension was reloaded while this
+     * content script instance was still running as a zombie).
+     * @param {object} msg
+     * @returns {Promise<void>}
+     */
+    function safeSendMessage(msg) {
+        let promise;
+        try {
+            promise = chrome.runtime.sendMessage(msg);
+        } catch (syncErr) {
+            // sendMessage throws synchronously on fully invalidated contexts.
+            if (syncErr?.message?.includes('Extension context')) {
+                clearInterval(captureInterval);
+            }
+            return Promise.resolve();
+        }
+        return promise.catch((asyncErr) => {
+            if (asyncErr?.message?.includes('Extension context')) {
+                clearInterval(captureInterval);
+            }
+        });
+    }
+
+    function captureFrame() {
+        // Quick guard — belt-and-suspenders check before doing any work.
+        if (!chrome.runtime?.id) {
+            clearInterval(captureInterval);
             return;
         }
 
-        try {
-            ctx.drawImage(
-                video,
-                0,
-                0,
-                CANVAS_SIZE,
-                CANVAS_SIZE
-            );
+        const allVideos = Array.from(document.querySelectorAll('video'));
+        const video = findTargetVideo();
 
-            const frameDataString = canvas.toDataURL(
-                "image/jpeg",
-                0.6
-            );
-
-            chrome.runtime.sendMessage({
-                type: "FRAME_DATA",
-                payload: frameDataString
-            }).catch(() => {
-                // Background worker may temporarily be unavailable.
-            });
-
-        } catch (error) {
-            console.warn(
-                "[AI Detector] Frame capture failed:",
-                error
-            );
+        if (!video) {
+            if (allVideos.length === 0) {
+                console.debug('[AI Detector] No <video> elements found on this page.');
+            } else {
+                console.debug(
+                    `[AI Detector] Found ${allVideos.length} video(s) but none passed visibility check.`,
+                    allVideos.map(v => ({
+                        src: v.currentSrc?.slice(0, 60),
+                        readyState: v.readyState,
+                        paused: v.paused,
+                        ended: v.ended,
+                        size: `${Math.round(v.getBoundingClientRect().width)}x${Math.round(v.getBoundingClientRect().height)}`
+                    }))
+                );
+            }
+            safeSendMessage({ type: 'NO_VIDEO' });
+            return;
         }
+
+        // Send only the video's bounding rect to the background.
+        // The background uses captureVisibleTab() to take the actual screenshot,
+        // which bypasses all canvas cross-origin and file:// restrictions.
+        const rect = video.getBoundingClientRect();
+        safeSendMessage({
+            type: 'REQUEST_TAB_CAPTURE',
+            rect: {
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+                devicePixelRatio: window.devicePixelRatio || 1
+            }
+        });
     }
 
     // ============================================================
@@ -285,25 +214,47 @@
     // Background Communication
     // ============================================================
 
-    chrome.runtime.onMessage.addListener((message) => {
-        if (!message || message.type !== "UPDATE_UI") {
-            return;
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        // ── Live UI update from background after inference ──
+        if (message?.type === 'UPDATE_UI') {
+            updateTrafficLight(message.confidence);
+            return false;
         }
 
-        updateTrafficLight(message.confidence);
+        // ── Direct status query from popup ──────────────────
+        // Popup uses this to bypass the background cache,
+        // which may be empty after a service worker restart.
+        if (message?.type === 'GET_VIDEO_STATUS') {
+            const allVideos = Array.from(document.querySelectorAll('video'));
+            const video = findTargetVideo();
+
+            if (!video) {
+                sendResponse({
+                    status: 'no_video',
+                    videoCount: allVideos.length,
+                    detail: allVideos.map(v => ({
+                        readyState: v.readyState,
+                        paused: v.paused,
+                        ended: v.ended,
+                        w: Math.round(v.getBoundingClientRect().width),
+                        h: Math.round(v.getBoundingClientRect().height)
+                    }))
+                });
+            } else {
+                sendResponse({ status: 'found', videoCount: allVideos.length });
+                // Kick off an immediate capture so inference starts ASAP.
+                captureFrame();
+            }
+            return true;
+        }
+
+        return false;
     });
 
     // ============================================================
     // 1 FPS Capture Loop
     // ============================================================
 
-    const captureInterval = setInterval(
-        captureFrame,
-        FRAME_INTERVAL
-    );
-
-    // Prevent accidental unused-variable optimization warnings
-    // while keeping the interval alive for the lifetime of the page.
-    void captureInterval;
+    captureInterval = setInterval(captureFrame, FRAME_INTERVAL);
 
 })();

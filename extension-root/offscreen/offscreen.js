@@ -42,12 +42,15 @@ async function initializeSession() {
 initializeSession();
 
 /**
- * Decodes a base64 JPEG data URL into a 224x224 RGB pixel buffer using the
- * hidden canvas element.
+ * Decodes a JPEG data URL and extracts a 224x224 RGB pixel buffer.
+ * If srcRect is provided, the image is cropped to that region first
+ * (used when the dataUrl is a full-tab screenshot rather than a pre-cropped frame).
+ *
  * @param {string} dataUrl
+ * @param {{ x: number, y: number, width: number, height: number, devicePixelRatio: number }|null} srcRect
  * @returns {Promise<Uint8ClampedArray>}
  */
-function decodeFrameToPixels(dataUrl) {
+function decodeFrameToPixels(dataUrl, srcRect = null) {
     return new Promise((resolve, reject) => {
         try {
             const canvas = document.getElementById('inference-canvas');
@@ -57,10 +60,24 @@ function decodeFrameToPixels(dataUrl) {
             img.onload = () => {
                 try {
                     ctx.clearRect(0, 0, 224, 224);
-                    ctx.drawImage(img, 0, 0, 224, 224);
-                    // Preprocess raw canvas pixels [224x224 RGB] into standard ImageNet format
-                    const imgData = ctx.getImageData(0, 0, 224, 224).data;
-                    resolve(imgData);
+
+                    if (srcRect) {
+                        // Full-tab screenshot: crop to video element position.
+                        // captureVisibleTab returns pixels at device resolution,
+                        // so multiply CSS coords by devicePixelRatio.
+                        const dpr = srcRect.devicePixelRatio || 1;
+                        ctx.drawImage(
+                            img,
+                            srcRect.x * dpr, srcRect.y * dpr,   // source crop origin
+                            srcRect.width * dpr, srcRect.height * dpr, // source crop size
+                            0, 0, 224, 224                       // dest: full 224x224 canvas
+                        );
+                    } else {
+                        // Pre-cropped frame — draw directly.
+                        ctx.drawImage(img, 0, 0, 224, 224);
+                    }
+
+                    resolve(ctx.getImageData(0, 0, 224, 224).data);
                 } catch (drawErr) {
                     reject(drawErr);
                 }
@@ -140,11 +157,12 @@ function extractSoftmaxConfidence(outputTensor) {
 }
 
 /**
- * Full pipeline: decode -> preprocess -> run inference -> dispose tensors.
- * @param {string} payload Base64 JPEG data URL
+ * Full pipeline: decode/crop -> preprocess -> run inference -> dispose tensors.
+ * @param {string} payload   JPEG data URL (full screenshot or pre-cropped frame)
  * @param {number} targetTabId
+ * @param {object|null} rect Video bounding rect with devicePixelRatio (for screenshots)
  */
-async function processFrame(payload, targetTabId) {
+async function processFrame(payload, targetTabId, rect = null) {
     let inputTensor = null;
     let outputMap = null;
 
@@ -157,7 +175,7 @@ async function processFrame(payload, targetTabId) {
             }
         }
 
-        const imgData = await decodeFrameToPixels(payload);
+        const imgData = await decodeFrameToPixels(payload, rect);
         const processedData = preprocessPixels(imgData);
 
         // Wrap in the ONNX input tensor
@@ -200,11 +218,19 @@ async function processFrame(payload, targetTabId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message && message.type === 'PROCESS_FRAME') {
-        const { payload, targetTabId } = message;
-        processFrame(payload, targetTabId);
-        // No synchronous response needed; result is sent via a separate message.
+    // Full-tab screenshot with crop rect — primary path (no canvas taint issues).
+    if (message?.type === 'PROCESS_SCREENSHOT') {
+        const { payload, rect, targetTabId } = message;
+        processFrame(payload, targetTabId, rect);
         return false;
     }
+
+    // Pre-cropped frame — legacy / fallback path.
+    if (message?.type === 'PROCESS_FRAME') {
+        const { payload, targetTabId } = message;
+        processFrame(payload, targetTabId, null);
+        return false;
+    }
+
     return false;
 });

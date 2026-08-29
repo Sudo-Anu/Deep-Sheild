@@ -86,40 +86,105 @@
 
     setIdle();
 
-    let activeTabId;
+    let activeTab;
     try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        activeTabId = tab?.id;
+        [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
     } catch (e) {
         footerText.textContent = 'Could not read active tab';
         return;
     }
 
+    const activeTabId = activeTab?.id;
     if (typeof activeTabId !== 'number') {
         setIdle();
         return;
     }
 
-    // Ask the background for this tab's cached result.
-    chrome.runtime.sendMessage(
-        { type: 'GET_STATUS', tabId: activeTabId },
-        (response) => {
-            if (chrome.runtime.lastError) {
-                // Background not ready yet.
-                setIdle();
+    /**
+     * Queries the content script for live video status.
+     * If the content script isn't injected yet, injects it first then retries once.
+     * @param {boolean} [isRetry=false]
+     */
+    function queryVideoStatus(isRetry = false) {
+        chrome.tabs.sendMessage(activeTabId, { type: 'GET_VIDEO_STATUS' }, (csResponse) => {
+            // Content script not running — inject it programmatically and retry.
+            if ((chrome.runtime.lastError || !csResponse) && !isRetry) {
+                footerText.textContent = 'Injecting extension...';
+                verdictIcon.textContent = '⚙️';
+                verdictTitle.textContent = 'Activating...';
+                verdictSub.textContent = 'Injecting extension into this page';
+
+                Promise.all([
+                    chrome.scripting.executeScript({
+                        target: { tabId: activeTabId, allFrames: true },
+                        files: ['content/content.js']
+                    }),
+                    chrome.scripting.insertCSS({
+                        target: { tabId: activeTabId, allFrames: true },
+                        files: ['content/content.css']
+                    })
+                ])
+                .then(() => {
+                    // Give the script a moment to initialize, then retry.
+                    setTimeout(() => queryVideoStatus(true), 300);
+                })
+                .catch((injectErr) => {
+                    // Injection failed — likely a restricted page (chrome://, Web Store, etc.).
+                    verdictIcon.textContent = '🚫';
+                    verdictTitle.textContent = 'Cannot access this page';
+                    verdictSub.textContent = 'Extension cannot run on browser internal pages';
+                    footerText.textContent = 'Navigate to a normal website';
+                    console.warn('[Popup] Script injection failed:', injectErr);
+                });
                 return;
             }
 
-            if (!response || response.confidence === null || response.confidence === undefined) {
-                setNoVideo();
+            // Injection succeeded but still no response — restricted page.
+            if (chrome.runtime.lastError || !csResponse) {
+                verdictIcon.textContent = '🚫';
+                verdictTitle.textContent = 'Cannot access this page';
+                verdictSub.textContent = 'Extension cannot run on browser internal pages';
+                footerText.textContent = 'Navigate to a normal website';
                 return;
             }
 
-            applyResult(response.confidence);
-        }
-    );
+            // ── Content script responded ───────────────────────────────────────
+            if (csResponse.status === 'no_video') {
+                if (csResponse.videoCount > 0) {
+                    verdictIcon.textContent = '📺';
+                    verdictTitle.textContent = 'Video not eligible';
+                    verdictSub.textContent =
+                        `Found ${csResponse.videoCount} video(s) — none are playing or in view`;
+                    footerText.textContent = 'Play the video and scroll it into view';
+                } else {
+                    setNoVideo();
+                }
+                return;
+            }
 
-    // Also listen for live updates while popup is open.
+            // Video found — show "Analysing" and also pull cached confidence.
+            statusDot.classList.add('active');
+            verdictIcon.textContent = '⚙️';
+            verdictTitle.textContent = 'Analysing...';
+            verdictSub.textContent = 'Video found — running inference';
+            footerText.textContent = 'Processing frame...';
+
+            chrome.runtime.sendMessage(
+                { type: 'GET_STATUS', tabId: activeTabId },
+                (bgResponse) => {
+                    if (chrome.runtime.lastError) return;
+                    const state = bgResponse?.state;
+                    if (state?.confidence != null) {
+                        applyResult(state.confidence);
+                    }
+                }
+            );
+        });
+    }
+
+    queryVideoStatus();
+
+    // Live updates while popup is open.
     chrome.runtime.onMessage.addListener((message) => {
         if (message?.type === 'UPDATE_UI' && message.targetTabId === activeTabId) {
             applyResult(message.confidence);
