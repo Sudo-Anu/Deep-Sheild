@@ -153,60 +153,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === 'INFERENCE_RESULT') {
         const { confidence, targetTabId } = message;
 
-        // Persist result so popup reads it even after SW restart.
-        chrome.storage.session.set({ [tabKey(targetTabId)]: { confidence } });
-
-        console.log(
-            `[Background] INFERENCE_RESULT received for tab ${targetTabId}. Confidence: ${confidence}`
-        );
-
         if (typeof targetTabId !== 'number') {
-            console.error(
-                '[Background] INFERENCE_RESULT rejected: target tab ID is invalid.'
-            );
-
-            sendResponse({
-                success: false,
-                error: 'Invalid target tab ID.'
-            });
-
+            console.error('[Background] INFERENCE_RESULT rejected: target tab ID is invalid.');
+            sendResponse({ success: false, error: 'Invalid target tab ID.' });
             return true;
         }
 
-        (async () => {
-            try {
-                console.log(
-                    `[Background] Sending UPDATE_UI to originating tab ${targetTabId}...`
-                );
+        // Persist result so popup reads it even after SW restart.
+        chrome.storage.session.set({ [tabKey(targetTabId)]: { confidence } });
 
+        console.log(`[Background] INFERENCE_RESULT for tab ${targetTabId}. Confidence: ${confidence}`);
+
+        (async () => {
+            // ── 1. Broadcast to all extension pages (popup, etc.) ────────────────
+            // chrome.tabs.sendMessage only reaches content scripts.
+            // chrome.runtime.sendMessage broadcasts to ALL extension pages,
+            // so the popup receives live updates while it is open.
+            chrome.runtime.sendMessage({
+                type: 'UPDATE_UI',
+                confidence,
+                targetTabId
+            }).catch(() => {
+                // Popup may not be open — ignore the "no listener" error.
+            });
+
+            // ── 2. Also push to the in-page traffic light overlay ─────────────
+            try {
                 await chrome.tabs.sendMessage(targetTabId, {
                     type: 'UPDATE_UI',
                     confidence
                 });
-
-                console.log(
-                    `[Background] UPDATE_UI successfully delivered to tab ${targetTabId}.`
-                );
-
-                sendResponse({
-                    success: true
-                });
-            } catch (error) {
-                // The tab may have been closed, navigated, or reloaded while
-                // inference was running. Prevent an unhandled rejection.
-                console.warn(
-                    `[Background] Could not deliver UPDATE_UI to tab ${targetTabId}:`,
-                    error
-                );
-
-                sendResponse({
-                    success: false,
-                    error: error instanceof Error ? error.message : String(error)
-                });
+                console.log(`[Background] UPDATE_UI delivered to tab ${targetTabId}.`);
+            } catch (tabErr) {
+                // Tab may have closed or navigated — not fatal.
+                console.warn(`[Background] Could not deliver UPDATE_UI to tab ${targetTabId}:`, tabErr);
             }
+
+            sendResponse({ success: true });
         })();
 
-        // Keep the message channel open for the asynchronous response.
         return true;
     }
 
