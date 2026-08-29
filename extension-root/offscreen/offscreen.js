@@ -30,7 +30,7 @@ async function initializeSession() {
     try {
         console.log('[offscreen] Initializing ONNX inference session...');
         const options = { executionProviders: ['wasm'] };
-        session = await ort.InferenceSession.create('../assets/mobilenetv2-7-quantized.onnx', options);
+        session = await ort.InferenceSession.create('../assets/deepfake_efficientnet_b0_int8.onnx', options);
         console.log('[offscreen] Model ready. Input names:', session.inputNames, 'Output names:', session.outputNames);
     } catch (err) {
         console.error('[offscreen] Failed to initialize inference session:', err);
@@ -124,36 +124,47 @@ function preprocessPixels(imgData) {
 }
 
 /**
- * Applies softmax over all logits in the output tensor and returns the
- * highest class probability scaled to a 0–100 percentage.
+ * Converts the model's 2-class output logits into an authenticity confidence
+ * score in the range [0, 100].
  *
- * Using raw logits as a confidence score is incorrect because their magnitude
- * is unbounded and not comparable to the percentage thresholds used in the
- * traffic-light UI (< 40 = red, ≤ 75 = orange, > 75 = green).
+ * Model output layout (EfficientNet-B0 deepfake classifier):
+ *   index 0 = "real" logit
+ *   index 1 = "fake" logit
+ *
+ * We apply softmax to get probabilities, then return:
+ *   real_probability × 100  →  score near 100 = authentic, near 0 = AI-generated
+ *
+ * This maps cleanly to the traffic-light thresholds:
+ *   score < 40   → Red  (Likely AI-generated)
+ *   score ≤ 75   → Orange (Uncertain)
+ *   score > 75   → Green (Likely Real)
  *
  * @param {ort.Tensor} outputTensor
- * @returns {number} Confidence percentage in [0, 100]
+ * @returns {number} Authenticity percentage in [0, 100]
  */
-function extractSoftmaxConfidence(outputTensor) {
+function extractConfidence(outputTensor) {
     const data = outputTensor.data;
-    const len  = data.length;
 
-    // Numerically stable softmax: subtract max before exp.
-    let maxLogit = -Infinity;
-    for (let i = 0; i < len; i++) {
-        if (data[i] > maxLogit) maxLogit = data[i];
+    if (data.length === 1) {
+        // Single sigmoid output: value near 1 = fake, near 0 = real.
+        // Convert to authenticity: (1 - fake_prob) * 100
+        const fakeProbability = 1 / (1 + Math.exp(-data[0]));
+        return (1 - fakeProbability) * 100;
     }
 
-    let sumExp = 0;
-    let maxExp = 0;
-    for (let i = 0; i < len; i++) {
-        const e = Math.exp(data[i] - maxLogit);
-        sumExp += e;
-        if (e > maxExp) maxExp = e;
-    }
+    // 2-class softmax output: [real_logit, fake_logit]
+    const realLogit = data[0];
+    const fakeLogit = data[1];
 
-    // Highest softmax probability → scale to [0, 100]
-    return (maxExp / sumExp) * 100;
+    // Numerically stable softmax
+    const maxLogit = Math.max(realLogit, fakeLogit);
+    const expReal = Math.exp(realLogit - maxLogit);
+    const expFake = Math.exp(fakeLogit - maxLogit);
+    const sum     = expReal + expFake;
+
+    const realProbability = expReal / sum;
+
+    return realProbability * 100;
 }
 
 /**
@@ -186,7 +197,7 @@ async function processFrame(payload, targetTabId, rect = null) {
 
         const outputName = session.outputNames && session.outputNames[0] ? session.outputNames[0] : Object.keys(outputMap)[0];
         const outputTensor = outputMap[outputName];
-        const highestConfidenceScore = extractSoftmaxConfidence(outputTensor);
+        const highestConfidenceScore = extractConfidence(outputTensor);
 
         chrome.runtime.sendMessage({
             type: 'INFERENCE_RESULT',
