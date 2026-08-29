@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deep Shield</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+    <div class="container">
+
+        <!-- Header -->
+        <div class="header">
+            <div class="logo">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                    <path d="M12 2L3 7V13C3 17.97 7.02 22.62 12 24C16.98 22.62 21 17.97 21 13V7L12 2Z"
+                          fill="url(#shield-grad)" />
+                    <defs>
+                        <linearGradient id="shield-grad" x1="3" y1="2" x2="21" y2="24" gradientUnits="userSpaceOnUse">
+                            <stop offset="0%" stop-color="#6366f1"/>
+                            <stop offset="100%" stop-color="#8b5cf6"/>
+                        </linearGradient>
+                    </defs>
+                </svg>
+            </div>
+            <span class="brand">Deep Shield</span>
+            <div class="status-dot" id="status-dot"></div>
+        </div>
+
+        <!-- Traffic Light Panel -->
+        <div class="light-panel">
+            <div class="lights-track">
+                <div class="light-slot">
+                    <div class="light red" id="light-red"></div>
+                    <span class="light-label">AI</span>
+                </div>
+                <div class="light-slot">
+                    <div class="light orange" id="light-orange"></div>
+                    <span class="light-label">Mixed</span>
+                </div>
+                <div class="light-slot">
+                    <div class="light green" id="light-green"></div>
+                    <span class="light-label">Real</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Verdict -->
+        <div class="verdict-box" id="verdict-box">
+            <div class="verdict-icon" id="verdict-icon">—</div>
+            <div class="verdict-text">
+                <div class="verdict-title" id="verdict-title">Waiting for video...</div>
+                <div class="verdict-sub" id="verdict-sub">Open a page with a playing video</div>
+            </div>
+        </div>
+
+        <!-- Confidence Bar -->
+        <div class="confidence-section" id="confidence-section" style="display:none">
+            <div class="confidence-header">
+                <span class="confidence-label">Confidence</span>
+                <span class="confidence-value" id="confidence-value">0%</span>
+            </div>
+            <div class="confidence-track">
+                <div class="confidence-fill" id="confidence-fill"></div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <span id="footer-text">No active analysis</span>
+        </div>
+    </div>
+    <script src="popup.js"></script>
+</body>
+</html>
