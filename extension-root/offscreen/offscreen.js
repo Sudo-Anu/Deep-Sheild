@@ -59,12 +59,19 @@ initializeSession();
 async function initializeAudioSession() {
     try {
         console.log('[offscreen] Initializing audio ONNX session...');
+        const modelUrl = chrome.runtime.getURL('assets/audio_clone_detector.onnx');
+        console.log('[offscreen] Loading audio model from:', modelUrl);
         const options = { executionProviders: ['wasm'] };
-        audioSession = await ort.InferenceSession.create('../assets/audio_clone_detector.onnx', options);
+        audioSession = await ort.InferenceSession.create(modelUrl, options);
         console.log('[offscreen] Audio model ready. Inputs:', audioSession.inputNames, 'Outputs:', audioSession.outputNames);
     } catch (err) {
         // Non-fatal: model may not be present yet. Audio inference will be skipped.
-        console.warn('[offscreen] Audio model not loaded (expected if model file is absent):', err.message);
+        console.warn(
+            '[offscreen] Audio model not loaded. Place your ONNX file at:\n' +
+            '  extension-root/assets/audio_clone_detector.onnx\n' +
+            'Expected input shape: [1, 1, 128, 128] | output: [1, 2]\n' +
+            'Error:', err.message
+        );
         audioSession = null;
     }
 }
@@ -386,11 +393,12 @@ function buildMelFilterbank(sampleRate) {
     return filterbank;
 }
 
-/** Cached mel filterbank (built once, reused across audio chunks). */
-let _melFilterbank = null;
+/** Cached mel filterbanks, keyed by sample rate string to handle varying input rates. */
+const _melFilterbankCache = {};
 function getMelFilterbank(sampleRate) {
-    if (!_melFilterbank) _melFilterbank = buildMelFilterbank(sampleRate);
-    return _melFilterbank;
+    const key = String(sampleRate);
+    if (!_melFilterbankCache[key]) _melFilterbankCache[key] = buildMelFilterbank(sampleRate);
+    return _melFilterbankCache[key];
 }
 
 /**

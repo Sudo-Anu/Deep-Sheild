@@ -49,7 +49,7 @@
         footerText.textContent = 'Extension active — no video';
     }
 
-    function applyResult(confidence, audioConfidence) {
+    function applyResult(confidence, audioConfidence, audioStatus) {
         // Worst-case merged score: lowest of the two available signals.
         const videoScore = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
         const audioScore = Number.isFinite(Number(audioConfidence)) ? Number(audioConfidence) : null;
@@ -76,10 +76,18 @@
             audioConfValue.textContent = audioScore.toFixed(1) + '%';
             audioConfFill.style.width = Math.min(audioScore, 100) + '%';
             audioConfFill.className = 'confidence-fill ' + scoreClass(audioScore);
+        } else if (audioStatus === 'no_model') {
+            // ONNX model file not present yet — tell the user clearly.
+            audioConfSection.style.display = 'flex';
+            audioConfValue.textContent = 'No model';
+            audioConfFill.style.width = '0%';
+            audioConfFill.className = 'confidence-fill';
         } else {
+            // Model loaded but still buffering the first 3-second chunk.
             audioConfSection.style.display = 'flex';
             audioConfValue.textContent = 'Scanning…';
             audioConfFill.style.width = '0%';
+            audioConfFill.className = 'confidence-fill';
         }
 
         // ── Shared traffic-light + verdict (worst-case merged score) ────────
@@ -186,6 +194,27 @@
             }
 
             // ── Content script responded ───────────────────────────────────────
+            if (csResponse.status === 'audio_only') {
+                // Audio-only page (e.g. .mp3 opened directly in browser)
+                statusDot.classList.add('active');
+                verdictIcon.textContent = '🎙️';
+                verdictTitle.textContent = 'Audio-only content';
+                verdictSub.textContent = 'Monitoring audio for voice cloning';
+                footerText.textContent = 'Video analysis not applicable';
+                // Still pull any cached audio result.
+                chrome.runtime.sendMessage(
+                    { type: 'GET_STATUS', tabId: activeTabId },
+                    (bgResponse) => {
+                        if (chrome.runtime.lastError) return;
+                        const state = bgResponse?.state;
+                        if (state?.audioConfidence != null) {
+                            applyResult(null, state.audioConfidence, state.audioStatus);
+                        }
+                    }
+                );
+                return;
+            }
+
             if (csResponse.status === 'no_video') {
                 if (csResponse.videoCount > 0) {
                     verdictIcon.textContent = '📺';
@@ -224,7 +253,7 @@
     // Live updates while popup is open.
     chrome.runtime.onMessage.addListener((message) => {
         if (message?.type === 'UPDATE_UI' && message.targetTabId === activeTabId) {
-            applyResult(message.confidence, message.audioConfidence);
+            applyResult(message.confidence, message.audioConfidence, message.audioStatus);
         }
     });
 

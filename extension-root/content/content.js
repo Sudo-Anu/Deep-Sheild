@@ -178,23 +178,46 @@
         }
 
         try {
-            audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+            // Do NOT specify sampleRate here — let the AudioContext pick its native
+            // rate (usually 44100 or 48000). We read audioContext.sampleRate afterwards
+            // and report it accurately to offscreen so the resampler works correctly.
+            audioContext = new AudioContext();
         } catch (err) {
             console.warn('[AI Detector] Could not create AudioContext:', err.message);
             return;
         }
 
+        // Chrome often suspends AudioContexts created in content scripts because
+        // they were not created inside a direct user-gesture handler.
+        // resume() is required before onaudioprocess will ever fire.
+        if (audioContext.state === 'suspended') {
+            audioContext.resume().then(() => {
+                console.debug('[AI Detector] AudioContext resumed. State:', audioContext.state);
+            }).catch(err => {
+                console.warn('[AI Detector] AudioContext.resume() failed:', err.message);
+            });
+        }
+
+        // Log state changes to aid debugging.
+        audioContext.onstatechange = () => {
+            console.debug('[AI Detector] AudioContext state changed:', audioContext.state);
+        };
+
+        // Capture the ACTUAL sample rate that the AudioContext settled on.
+        const actualSampleRate = audioContext.sampleRate;
+        const targetSamples   = Math.floor(actualSampleRate * AUDIO_BUFFER_SECONDS);
+        console.debug(`[AI Detector] AudioContext created. Rate: ${actualSampleRate}Hz, target buffer: ${targetSamples} samples`);
+
         try {
             audioSourceNode = audioContext.createMediaStreamSource(stream);
 
             // ScriptProcessorNode is deprecated but universally available in MV3
-            // offscreen and content script contexts without SharedArrayBuffer.
-            // An AudioWorklet would require fetching an external worklet script,
-            // which conflicts with MV3 CSP — ScriptProcessor is the safe choice here.
+            // content script contexts without SharedArrayBuffer.
+            // AudioWorklet would need an external worklet file which conflicts with CSP.
             scriptProcessor = audioContext.createScriptProcessor(
                 SCRIPT_BUFFER_SIZE,
                 1,   // mono input
-                1    // mono output (passthrough, speakers not affected)
+                1    // mono output
             );
 
             scriptProcessor.onaudioprocess = (event) => {
@@ -204,31 +227,35 @@
                 }
 
                 const channelData = event.inputBuffer.getChannelData(0);
-                // Append samples into the rolling buffer.
                 for (let i = 0; i < channelData.length; i++) {
                     pcmBuffer.push(channelData[i]);
                 }
 
-                if (pcmBuffer.length >= TARGET_SAMPLES) {
-                    // Snapshot the buffer and reset immediately (non-blocking).
-                    const chunk = pcmBuffer.slice(0, TARGET_SAMPLES);
+                if (pcmBuffer.length >= targetSamples) {
+                    const chunk = pcmBuffer.slice(0, targetSamples);
                     pcmBuffer = [];
 
-                    // Send as plain Array — structured-clone can transfer this
-                    // reliably across the content -> background boundary.
+                    // Report the ACTUAL AudioContext rate — not the constant —
+                    // so offscreen.js resamples from the correct source rate.
                     safeSendMessage({
                         type:       'REQUEST_AUDIO_INFERENCE',
                         samples:    Array.from(chunk),
-                        sampleRate: AUDIO_SAMPLE_RATE
+                        sampleRate: actualSampleRate
                     });
 
-                    console.debug(`[AI Detector] Audio chunk sent: ${chunk.length} samples @ ${AUDIO_SAMPLE_RATE}Hz`);
+                    console.debug(`[AI Detector] Audio chunk sent: ${chunk.length} samples @ ${actualSampleRate}Hz`);
                 }
             };
 
-            // Connect: source → processor → destination (required to keep graph alive).
+            // Route through a silent GainNode (gain=0) to:
+            //  a) keep the audio graph active without playing back through speakers twice
+            //  b) satisfy Chrome's requirement that the graph reach the destination
+            const silentGain = audioContext.createGain();
+            silentGain.gain.value = 0;
+
             audioSourceNode.connect(scriptProcessor);
-            scriptProcessor.connect(audioContext.destination);
+            scriptProcessor.connect(silentGain);
+            silentGain.connect(audioContext.destination);
 
             currentAudioVideo = video;
             console.debug('[AI Detector] Audio capture started.');
@@ -237,7 +264,6 @@
             stopAudioCapture();
         }
     }
-
 
     /**
      * Sends a message to the background, self-terminating if the extension
@@ -390,8 +416,14 @@
                     }))
                 });
             } else {
-                sendResponse({ status: 'found', videoCount: allVideos.length });
-                // Kick off an immediate capture so inference starts ASAP.
+                // Distinguish audio-only elements (videoWidth === 0) from real video.
+                const hasVideoTrack = video.videoWidth > 0 && video.videoHeight > 0;
+                if (hasVideoTrack) {
+                    sendResponse({ status: 'found', videoCount: allVideos.length });
+                } else {
+                    sendResponse({ status: 'audio_only', videoCount: allVideos.length });
+                }
+                // Kick off an immediate capture cycle so inference starts ASAP.
                 captureFrame();
             }
             return true;
