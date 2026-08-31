@@ -293,6 +293,20 @@
             return;
         }
 
+        // Check whether this element actually has a video track.
+        // Chrome's built-in audio player renders audio files as a <video> element
+        // with videoWidth === 0 — running the vision model on its UI screenshot
+        // produces meaningless scores. Audio-only elements go straight to audio capture.
+        const hasVideoTrack = video.videoWidth > 0 && video.videoHeight > 0;
+
+        if (!hasVideoTrack) {
+            console.debug('[AI Detector] Audio-only element — skipping video inference.');
+            // Still attempt audio capture, then tell background/popup this tab is audio-only.
+            startAudioCapture(video);
+            safeSendMessage({ type: 'AUDIO_ONLY' });
+            return;
+        }
+
         // Send only the video's bounding rect to the background.
         // The background uses captureVisibleTab() to take the actual screenshot,
         // which bypasses all canvas cross-origin and file:// restrictions.

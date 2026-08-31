@@ -145,6 +145,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return false;
     }
 
+    /**
+     * Node E: Content script found an audio-only element (no video track).
+     * Sets tab state so the popup can display the correct message.
+     */
+    if (message?.type === 'AUDIO_ONLY') {
+        const tabId = sender?.tab?.id;
+        if (typeof tabId === 'number') {
+            const key = tabKey(tabId);
+            chrome.storage.session.get([key], (result) => {
+                // Only set audio_only if there is no video confidence result yet.
+                if (!result[key]?.confidence) {
+                    chrome.storage.session.set({ [key]: { status: 'audio_only' } });
+                }
+            });
+        }
+        return false;
+    }
+
     // ---------------------------------------------------------------------------
     // Audio Pipeline Nodes
     // ---------------------------------------------------------------------------
@@ -193,10 +211,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
      * Merged traffic-light uses worst-case (min of the two scores).
      */
     if (message?.type === 'AUDIO_INFERENCE_RESULT') {
-        const { audioConfidence, targetTabId } = message;
+        const { audioConfidence, audioStatus, targetTabId } = message;
 
         if (typeof targetTabId !== 'number') {
             console.error('[Background] AUDIO_INFERENCE_RESULT rejected: target tab ID is invalid.');
+            return false;
+        }
+
+        // Short-circuit: model not present — notify popup immediately without merging.
+        if (audioStatus === 'no_model') {
+            console.log(`[Background] Audio model absent for tab ${targetTabId} — broadcasting no_model.`);
+            chrome.runtime.sendMessage({
+                type:        'UPDATE_UI',
+                audioStatus: 'no_model',
+                targetTabId
+            }).catch(() => {});
+            chrome.tabs.sendMessage(targetTabId, {
+                type:        'UPDATE_UI',
+                audioStatus: 'no_model'
+            }).catch(() => {});
             return false;
         }
 

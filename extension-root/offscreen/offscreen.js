@@ -487,7 +487,14 @@ async function processAudioChunk(rawSamples, srcRate, targetTabId) {
             console.warn('[offscreen] Audio session not ready; attempting to initialize now.');
             await initializeAudioSession();
             if (!audioSession) {
-                console.warn('[offscreen] Audio model unavailable — skipping audio inference.');
+                console.warn('[offscreen] Audio model unavailable — notifying UI.');
+                // Broadcast immediately so the popup stops showing "Scanning…"
+                // instead of waiting indefinitely for a result that will never come.
+                chrome.runtime.sendMessage({
+                    type:        'AUDIO_INFERENCE_RESULT',
+                    audioStatus: 'no_model',
+                    targetTabId
+                });
                 return;
             }
         }
