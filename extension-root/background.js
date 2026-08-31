@@ -145,6 +145,104 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return false;
     }
 
+    // ---------------------------------------------------------------------------
+    // Audio Pipeline Nodes
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Node A2: Audio PCM chunk from content script.
+     *
+     * Content script captures 3 s of PCM via Web Audio API and sends it here.
+     * Background forwards the chunk to the offscreen document for inference.
+     * Float32Array cannot cross the message boundary directly — it is transferred
+     * as a plain Array; offscreen.js wraps it back into Float32Array.
+     */
+    if (message?.type === 'REQUEST_AUDIO_INFERENCE') {
+        const originatingTabId = sender?.tab?.id;
+        const { samples, sampleRate } = message;
+
+        if (typeof originatingTabId !== 'number') {
+            console.error('[Background] REQUEST_AUDIO_INFERENCE rejected: sender tab ID unavailable.');
+            return false;
+        }
+
+        console.log(`[Background] REQUEST_AUDIO_INFERENCE from tab ${originatingTabId}, ${samples.length} samples @ ${sampleRate}Hz`);
+
+        (async () => {
+            try {
+                await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
+                await chrome.runtime.sendMessage({
+                    type:       'PROCESS_AUDIO',
+                    samples,
+                    sampleRate,
+                    targetTabId: originatingTabId
+                });
+            } catch (error) {
+                console.error(`[Background] Audio forwarding failed for tab ${originatingTabId}:`, error);
+            }
+        })();
+
+        return false;
+    }
+
+    /**
+     * Node B2: Audio Inference Result
+     *
+     * Offscreen Document -> Background -> Content Script / Popup
+     * Stores audioConfidence separately from video confidence.
+     * Merged traffic-light uses worst-case (min of the two scores).
+     */
+    if (message?.type === 'AUDIO_INFERENCE_RESULT') {
+        const { audioConfidence, targetTabId } = message;
+
+        if (typeof targetTabId !== 'number') {
+            console.error('[Background] AUDIO_INFERENCE_RESULT rejected: target tab ID is invalid.');
+            return false;
+        }
+
+        const key = tabKey(targetTabId);
+
+        // Merge with existing video score (worst-case strategy).
+        chrome.storage.session.get([key], (result) => {
+            const existing   = result[key] ?? {};
+            const videoScore = existing.confidence ?? null;
+
+            // Worst-case: use whichever modality is most alarming (lowest score).
+            const mergedScore = videoScore !== null
+                ? Math.min(videoScore, audioConfidence)
+                : audioConfidence;
+
+            chrome.storage.session.set({
+                [key]: {
+                    ...existing,
+                    audioConfidence,
+                    mergedScore
+                }
+            });
+
+            console.log(`[Background] AUDIO_INFERENCE_RESULT tab ${targetTabId}. Audio: ${audioConfidence.toFixed(1)}, Merged: ${mergedScore.toFixed(1)}`);
+
+            // Broadcast updated scores to popup and content script.
+            const videoScoreToSend = existing.confidence ?? null;
+            chrome.runtime.sendMessage({
+                type:            'UPDATE_UI',
+                confidence:      videoScoreToSend,
+                audioConfidence,
+                mergedScore,
+                targetTabId
+            }).catch(() => {});
+
+            chrome.tabs.sendMessage(targetTabId, {
+                type:            'UPDATE_UI',
+                confidence:      videoScoreToSend,
+                audioConfidence,
+                mergedScore
+            }).catch(() => {});
+        });
+
+        return false;
+    }
+
     /**
      * Node B: Model Inference Result
      *

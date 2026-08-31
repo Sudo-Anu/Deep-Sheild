@@ -7,8 +7,13 @@
     // Configuration
     // ============================================================
 
-    const FRAME_INTERVAL = 1000; // 1 FPS
-    const CANVAS_SIZE = 224;
+    const FRAME_INTERVAL      = 1000; // 1 FPS — video frame capture rate
+    const CANVAS_SIZE          = 224;
+
+    // Audio capture: collect 3 seconds of PCM then send for inference.
+    const AUDIO_BUFFER_SECONDS = 3;
+    const AUDIO_SAMPLE_RATE    = 44100; // native browser rate; offscreen resamples to 16kHz
+    const SCRIPT_BUFFER_SIZE   = 4096;  // ScriptProcessorNode buffer (samples per callback)
 
     // ============================================================
     // Traffic Light UI
@@ -114,6 +119,126 @@
     // can clear it when it detects the extension context has been invalidated.
     let captureInterval = null;
 
+    // ============================================================
+    // Audio Capture State
+    // ============================================================
+
+    let audioContext       = null;  // Web Audio context
+    let audioSourceNode    = null;  // MediaStreamAudioSourceNode
+    let scriptProcessor    = null;  // ScriptProcessorNode collecting PCM
+    let pcmBuffer          = [];    // Accumulated Float32 samples
+    let currentAudioVideo  = null;  // The <video> whose stream is currently captured
+    const TARGET_SAMPLES   = AUDIO_SAMPLE_RATE * AUDIO_BUFFER_SECONDS;
+
+    /**
+     * Tears down any existing Web Audio pipeline.
+     * Safe to call even if no pipeline is active.
+     */
+    function stopAudioCapture() {
+        try { scriptProcessor?.disconnect(); } catch (_) {}
+        try { audioSourceNode?.disconnect(); } catch (_) {}
+        try { if (audioContext?.state !== 'closed') audioContext?.close(); } catch (_) {}
+        scriptProcessor   = null;
+        audioSourceNode   = null;
+        audioContext      = null;
+        currentAudioVideo = null;
+        pcmBuffer         = [];
+    }
+
+    /**
+     * Attaches a Web Audio capture pipeline to a <video> element.
+     * Collects PCM samples and fires REQUEST_AUDIO_INFERENCE every 3 seconds.
+     *
+     * Gracefully no-ops if:
+     * - captureStream() is unavailable or throws (DRM / cross-origin).
+     * - AudioContext construction fails (e.g. restrictive CSP).
+     *
+     * @param {HTMLVideoElement} video
+     */
+    function startAudioCapture(video) {
+        // Already capturing this video — nothing to do.
+        if (currentAudioVideo === video) return;
+
+        // Tear down any previous capture before attaching to the new video.
+        stopAudioCapture();
+
+        let stream;
+        try {
+            // captureStream() may throw on cross-origin videos (SecurityError).
+            stream = video.captureStream();
+        } catch (err) {
+            console.debug('[AI Detector] captureStream() unavailable:', err.message);
+            return;
+        }
+
+        // Ensure the stream has at least one audio track.
+        if (!stream.getAudioTracks().length) {
+            console.debug('[AI Detector] Video has no audio tracks — skipping audio capture.');
+            return;
+        }
+
+        try {
+            audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+        } catch (err) {
+            console.warn('[AI Detector] Could not create AudioContext:', err.message);
+            return;
+        }
+
+        try {
+            audioSourceNode = audioContext.createMediaStreamSource(stream);
+
+            // ScriptProcessorNode is deprecated but universally available in MV3
+            // offscreen and content script contexts without SharedArrayBuffer.
+            // An AudioWorklet would require fetching an external worklet script,
+            // which conflicts with MV3 CSP — ScriptProcessor is the safe choice here.
+            scriptProcessor = audioContext.createScriptProcessor(
+                SCRIPT_BUFFER_SIZE,
+                1,   // mono input
+                1    // mono output (passthrough, speakers not affected)
+            );
+
+            scriptProcessor.onaudioprocess = (event) => {
+                if (!chrome.runtime?.id) {
+                    stopAudioCapture();
+                    return;
+                }
+
+                const channelData = event.inputBuffer.getChannelData(0);
+                // Append samples into the rolling buffer.
+                for (let i = 0; i < channelData.length; i++) {
+                    pcmBuffer.push(channelData[i]);
+                }
+
+                if (pcmBuffer.length >= TARGET_SAMPLES) {
+                    // Snapshot the buffer and reset immediately (non-blocking).
+                    const chunk = pcmBuffer.slice(0, TARGET_SAMPLES);
+                    pcmBuffer = [];
+
+                    // Send as plain Array — structured-clone can transfer this
+                    // reliably across the content -> background boundary.
+                    safeSendMessage({
+                        type:       'REQUEST_AUDIO_INFERENCE',
+                        samples:    Array.from(chunk),
+                        sampleRate: AUDIO_SAMPLE_RATE
+                    });
+
+                    console.debug(`[AI Detector] Audio chunk sent: ${chunk.length} samples @ ${AUDIO_SAMPLE_RATE}Hz`);
+                }
+            };
+
+            // Connect: source → processor → destination (required to keep graph alive).
+            audioSourceNode.connect(scriptProcessor);
+            scriptProcessor.connect(audioContext.destination);
+
+            currentAudioVideo = video;
+            console.debug('[AI Detector] Audio capture started.');
+        } catch (err) {
+            console.warn('[AI Detector] Failed to build audio graph:', err.message);
+            stopAudioCapture();
+        }
+    }
+
+
     /**
      * Sends a message to the background, self-terminating if the extension
      * context has been invalidated (i.e. the extension was reloaded while this
@@ -182,6 +307,9 @@
                 devicePixelRatio: window.devicePixelRatio || 1
             }
         });
+
+        // Start audio capture on the same video element (no-op if already running).
+        startAudioCapture(video);
     }
 
     // ============================================================
@@ -217,7 +345,14 @@
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // ── Live UI update from background after inference ──
         if (message?.type === 'UPDATE_UI') {
-            updateTrafficLight(message.confidence);
+            // Prefer mergedScore (worst-case of video + audio) when available.
+            // Fall back to whichever individual score is present.
+            const displayScore =
+                message.mergedScore   != null ? message.mergedScore   :
+                message.confidence    != null ? message.confidence    :
+                message.audioConfidence != null ? message.audioConfidence : null;
+
+            updateTrafficLight(displayScore);
             return false;
         }
 

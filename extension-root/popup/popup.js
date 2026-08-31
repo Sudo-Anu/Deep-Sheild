@@ -18,6 +18,11 @@
     const statusDot    = document.getElementById('status-dot');
     const footerText   = document.getElementById('footer-text');
 
+    // Audio confidence DOM refs.
+    const audioConfSection = document.getElementById('audio-confidence-section');
+    const audioConfValue   = document.getElementById('audio-confidence-value');
+    const audioConfFill    = document.getElementById('audio-confidence-fill');
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     function setIdle() {
@@ -27,6 +32,7 @@
         verdictTitle.textContent = 'Waiting for video...';
         verdictSub.textContent = 'Open a page with a playing video';
         confSection.style.display = 'none';
+        audioConfSection.style.display = 'none';
         statusDot.classList.remove('active');
         footerText.textContent = 'No active analysis';
     }
@@ -38,48 +44,79 @@
         verdictTitle.textContent = 'No video detected';
         verdictSub.textContent = 'Play a video on this page to start';
         confSection.style.display = 'none';
+        audioConfSection.style.display = 'none';
         statusDot.classList.remove('active');
         footerText.textContent = 'Extension active — no video';
     }
 
-    function applyResult(confidence) {
-        const score = Number(confidence);
-        if (!Number.isFinite(score)) { setIdle(); return; }
+    function applyResult(confidence, audioConfidence) {
+        // Worst-case merged score: lowest of the two available signals.
+        const videoScore = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
+        const audioScore = Number.isFinite(Number(audioConfidence)) ? Number(audioConfidence) : null;
 
+        // Determine display score — worst-case when both present.
+        const score =
+            videoScore !== null && audioScore !== null ? Math.min(videoScore, audioScore) :
+            videoScore !== null ? videoScore :
+            audioScore !== null ? audioScore : null;
+
+        if (score === null) { setIdle(); return; }
+
+        // ── Video bar ─────────────────────────────────────────
+        if (videoScore !== null) {
+            confSection.style.display = 'flex';
+            confValue.textContent = videoScore.toFixed(1) + '%';
+            confFill.style.width = Math.min(videoScore, 100) + '%';
+            confFill.className = 'confidence-fill ' + scoreClass(videoScore);
+        }
+
+        // ── Audio bar ─────────────────────────────────────────
+        if (audioScore !== null) {
+            audioConfSection.style.display = 'flex';
+            audioConfValue.textContent = audioScore.toFixed(1) + '%';
+            audioConfFill.style.width = Math.min(audioScore, 100) + '%';
+            audioConfFill.className = 'confidence-fill ' + scoreClass(audioScore);
+        } else {
+            audioConfSection.style.display = 'flex';
+            audioConfValue.textContent = 'Scanning…';
+            audioConfFill.style.width = '0%';
+        }
+
+        // ── Shared traffic-light + verdict (worst-case merged score) ────────
         statusDot.classList.add('active');
-        confSection.style.display = 'flex';
-        confValue.textContent = score.toFixed(1) + '%';
-        confFill.style.width = Math.min(score, 100) + '%';
-
         [lightRed, lightOrange, lightGreen].forEach(l => l.classList.remove('active'));
 
         if (score < 40) {
             lightRed.classList.add('active');
-            confFill.className = 'confidence-fill low';
             verdictBox.className = 'verdict-box ai';
             verdictIcon.textContent = '⚠️';
             verdictTitle.textContent = 'Likely AI-Generated';
-            verdictSub.textContent = `Low authenticity score (${score.toFixed(1)}%)`;
+            verdictSub.textContent = `Merged authenticity score (${score.toFixed(1)}%)`;
             footerText.textContent = 'AI-generated content suspected';
 
         } else if (score <= 75) {
             lightOrange.classList.add('active');
-            confFill.className = 'confidence-fill mid';
             verdictBox.className = 'verdict-box mixed';
             verdictIcon.textContent = '🟡';
             verdictTitle.textContent = 'Uncertain — Mixed Signals';
-            verdictSub.textContent = `Moderate authenticity score (${score.toFixed(1)}%)`;
+            verdictSub.textContent = `Merged authenticity score (${score.toFixed(1)}%)`;
             footerText.textContent = 'Content authenticity unclear';
 
         } else {
             lightGreen.classList.add('active');
-            confFill.className = 'confidence-fill high';
             verdictBox.className = 'verdict-box real';
             verdictIcon.textContent = '✅';
             verdictTitle.textContent = 'Likely Real Content';
-            verdictSub.textContent = `High authenticity score (${score.toFixed(1)}%)`;
+            verdictSub.textContent = `Merged authenticity score (${score.toFixed(1)}%)`;
             footerText.textContent = 'Content appears authentic';
         }
+    }
+
+    /** Maps a score to a CSS modifier class for the confidence bar. */
+    function scoreClass(score) {
+        if (score < 40)  return 'low';
+        if (score <= 75) return 'mid';
+        return 'high';
     }
 
     // ── Main: query background for active tab's latest result ─────────────────
@@ -174,8 +211,8 @@
                 (bgResponse) => {
                     if (chrome.runtime.lastError) return;
                     const state = bgResponse?.state;
-                    if (state?.confidence != null) {
-                        applyResult(state.confidence);
+                    if (state?.confidence != null || state?.audioConfidence != null) {
+                        applyResult(state.confidence, state.audioConfidence);
                     }
                 }
             );
@@ -187,7 +224,7 @@
     // Live updates while popup is open.
     chrome.runtime.onMessage.addListener((message) => {
         if (message?.type === 'UPDATE_UI' && message.targetTabId === activeTabId) {
-            applyResult(message.confidence);
+            applyResult(message.confidence, message.audioConfidence);
         }
     });
 

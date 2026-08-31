@@ -48,7 +48,8 @@
                 "lib/ort-wasm-simd-threaded.wasm",
                 "lib/ort-wasm-simd-threaded.jsep.wasm",
                 "lib/ort-wasm-simd-threaded.jsep.mjs",
-                "assets/deepfake_efficientnet_b0_int8.onnx"
+                "assets/deepfake_efficientnet_b0_int8.onnx",
+                "assets/audio_clone_detector.onnx"
             ],
             "matches": [
                 "<all_urls>"

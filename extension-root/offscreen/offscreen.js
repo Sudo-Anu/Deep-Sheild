@@ -22,6 +22,17 @@ ort.env.wasm.numThreads = 1;
 
 let session = null;
 
+// ---------------------------------------------------------------------------
+// Audio ONNX Session
+//
+// A second, independent inference session for voice-clone detection.
+// Loaded from assets/audio_clone_detector.onnx.
+// Input:  [1, 1, 128, 128]  — 128 mel-filter-bank × 128 time-frame log-mel spectrogram
+// Output: [1, 2]            — [real_logit, fake_logit] (same layout as vision model)
+// ---------------------------------------------------------------------------
+let audioSession = null;
+
+
 /**
  * Loads the local ONNX model and configures the WASM execution provider.
  * Runs once on script load; subsequent calls reuse the cached session.
@@ -40,6 +51,27 @@ async function initializeSession() {
 
 // Kick off model preloading immediately.
 initializeSession();
+
+/**
+ * Loads the audio clone detector ONNX model.
+ * Runs once; subsequent calls reuse the cached audioSession.
+ */
+async function initializeAudioSession() {
+    try {
+        console.log('[offscreen] Initializing audio ONNX session...');
+        const options = { executionProviders: ['wasm'] };
+        audioSession = await ort.InferenceSession.create('../assets/audio_clone_detector.onnx', options);
+        console.log('[offscreen] Audio model ready. Inputs:', audioSession.inputNames, 'Outputs:', audioSession.outputNames);
+    } catch (err) {
+        // Non-fatal: model may not be present yet. Audio inference will be skipped.
+        console.warn('[offscreen] Audio model not loaded (expected if model file is absent):', err.message);
+        audioSession = null;
+    }
+}
+
+// Kick off audio model preloading immediately (non-blocking).
+initializeAudioSession();
+
 
 /**
  * Decodes a JPEG data URL and extracts a 224x224 RGB pixel buffer.
@@ -243,5 +275,261 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return false;
     }
 
+    // Raw PCM audio chunk for voice-clone detection.
+    if (message?.type === 'PROCESS_AUDIO') {
+        const { samples, sampleRate, targetTabId } = message;
+        processAudioChunk(samples, sampleRate, targetTabId);
+        return false;
+    }
+
     return false;
 });
+
+// ===========================================================================
+// Audio Pipeline — Mel-Spectrogram + Voice-Clone Inference
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const AUDIO_SAMPLE_RATE   = 16000;  // target sample rate (model trained at 16kHz)
+const MEL_BINS            = 128;    // number of mel-filter banks
+const MEL_FRAMES          = 128;    // number of time frames in the spectrogram
+const FFT_SIZE            = 512;    // samples per FFT window (32ms @ 16kHz)
+const HOP_LENGTH          = Math.floor(AUDIO_SAMPLE_RATE * 3 / MEL_FRAMES); // ~375 samples
+
+/**
+ * Generates a Hann window of the given length.
+ * @param {number} length
+ * @returns {Float32Array}
+ */
+function hannWindow(length) {
+    const win = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+        win[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (length - 1)));
+    }
+    return win;
+}
+
+/** Pre-built Hann window (reused across calls). */
+const HANN_WIN = hannWindow(FFT_SIZE);
+
+/**
+ * Minimal in-place DFT for real-valued input — returns magnitude spectrum.
+ * Only computes the first (FFT_SIZE/2 + 1) bins (positive frequencies).
+ *
+ * Performance note: this is an O(N²) DFT, adequate for FFT_SIZE=512 at 1 chunk/3s.
+ * Replace with an FFT library if inference rate increases.
+ *
+ * @param {Float32Array} frame  Windowed PCM frame, length = FFT_SIZE
+ * @returns {Float32Array}      Magnitude spectrum, length = FFT_SIZE/2 + 1
+ */
+function rfftMagnitude(frame) {
+    const N    = frame.length;
+    const half = Math.floor(N / 2) + 1;
+    const mag  = new Float32Array(half);
+
+    for (let k = 0; k < half; k++) {
+        let re = 0, im = 0;
+        const twoPiKoverN = (2 * Math.PI * k) / N;
+        for (let n = 0; n < N; n++) {
+            re += frame[n] * Math.cos(twoPiKoverN * n);
+            im -= frame[n] * Math.sin(twoPiKoverN * n);
+        }
+        mag[k] = Math.sqrt(re * re + im * im);
+    }
+    return mag;
+}
+
+/**
+ * Builds a triangular mel-filter bank matrix.
+ * Returns a Float32Array of shape [MEL_BINS × (FFT_SIZE/2+1)] stored row-major.
+ *
+ * @param {number} sampleRate
+ * @returns {Float32Array}
+ */
+function buildMelFilterbank(sampleRate) {
+    const numFreqBins = Math.floor(FFT_SIZE / 2) + 1;
+
+    // Convert Hz to mel and back.
+    const hzToMel = hz => 2595 * Math.log10(1 + hz / 700);
+    const melToHz = mel => 700 * (Math.pow(10, mel / 2595) - 1);
+
+    const melMin = hzToMel(0);
+    const melMax = hzToMel(sampleRate / 2);
+
+    // (MEL_BINS + 2) evenly-spaced mel points.
+    const melPoints = new Float32Array(MEL_BINS + 2);
+    for (let i = 0; i < MEL_BINS + 2; i++) {
+        melPoints[i] = melToHz(melMin + (i / (MEL_BINS + 1)) * (melMax - melMin));
+    }
+
+    // Convert mel-centre frequencies to FFT bin indices.
+    const freqBins = melPoints.map(f => Math.floor((FFT_SIZE + 1) * f / sampleRate));
+
+    const filterbank = new Float32Array(MEL_BINS * numFreqBins); // row-major [mel, freq]
+
+    for (let m = 1; m <= MEL_BINS; m++) {
+        const lo  = freqBins[m - 1];
+        const mid = freqBins[m];
+        const hi  = freqBins[m + 1];
+
+        for (let k = lo; k < mid && k < numFreqBins; k++) {
+            if (mid !== lo) filterbank[(m - 1) * numFreqBins + k] = (k - lo) / (mid - lo);
+        }
+        for (let k = mid; k <= hi && k < numFreqBins; k++) {
+            if (hi !== mid) filterbank[(m - 1) * numFreqBins + k] = (hi - k) / (hi - mid);
+        }
+    }
+
+    return filterbank;
+}
+
+/** Cached mel filterbank (built once, reused across audio chunks). */
+let _melFilterbank = null;
+function getMelFilterbank(sampleRate) {
+    if (!_melFilterbank) _melFilterbank = buildMelFilterbank(sampleRate);
+    return _melFilterbank;
+}
+
+/**
+ * Linearly resamples a Float32Array from `srcRate` to `dstRate`.
+ * Simple linear interpolation — adequate for 44100→16000 conversion.
+ *
+ * @param {Float32Array} samples
+ * @param {number} srcRate
+ * @param {number} dstRate
+ * @returns {Float32Array}
+ */
+function resample(samples, srcRate, dstRate) {
+    if (srcRate === dstRate) return samples;
+    const ratio      = srcRate / dstRate;
+    const outLen     = Math.floor(samples.length / ratio);
+    const resampled  = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+        const pos  = i * ratio;
+        const idx  = Math.floor(pos);
+        const frac = pos - idx;
+        const a    = samples[idx]     ?? 0;
+        const b    = samples[idx + 1] ?? 0;
+        resampled[i] = a + frac * (b - a);
+    }
+    return resampled;
+}
+
+/**
+ * Computes a log-mel spectrogram from raw PCM samples.
+ *
+ * Output shape: [MEL_BINS × MEL_FRAMES] stored row-major (mel first),
+ * then reshaped into [1, 1, MEL_BINS, MEL_FRAMES] for the model.
+ *
+ * @param {Float32Array} pcm        Raw PCM at AUDIO_SAMPLE_RATE
+ * @returns {Float32Array}          Normalised log-mel values, length = MEL_BINS × MEL_FRAMES
+ */
+function computeLogMelSpectrogram(pcm) {
+    const numFreqBins = Math.floor(FFT_SIZE / 2) + 1;
+    const filterbank  = getMelFilterbank(AUDIO_SAMPLE_RATE);
+
+    // Output buffer [MEL_BINS × MEL_FRAMES]
+    const spec = new Float32Array(MEL_BINS * MEL_FRAMES);
+    let minVal = Infinity, maxVal = -Infinity;
+
+    for (let t = 0; t < MEL_FRAMES; t++) {
+        const start = t * HOP_LENGTH;
+
+        // Extract and window the frame.
+        const frame = new Float32Array(FFT_SIZE);
+        for (let i = 0; i < FFT_SIZE; i++) {
+            const s = start + i < pcm.length ? pcm[start + i] : 0;
+            frame[i] = s * HANN_WIN[i];
+        }
+
+        // Magnitude spectrum.
+        const mag = rfftMagnitude(frame);
+
+        // Apply mel filterbank and log-compress.
+        for (let m = 0; m < MEL_BINS; m++) {
+            let energy = 0;
+            const rowOffset = m * numFreqBins;
+            for (let k = 0; k < numFreqBins; k++) {
+                energy += filterbank[rowOffset + k] * mag[k];
+            }
+            const logEnergy = Math.log(Math.max(energy, 1e-9));
+            spec[m * MEL_FRAMES + t] = logEnergy;
+            if (logEnergy < minVal) minVal = logEnergy;
+            if (logEnergy > maxVal) maxVal = logEnergy;
+        }
+    }
+
+    // Normalize to [0, 1] across the full spectrogram.
+    const range = maxVal - minVal || 1;
+    for (let i = 0; i < spec.length; i++) {
+        spec[i] = (spec[i] - minVal) / range;
+    }
+
+    return spec;
+}
+
+/**
+ * Full audio pipeline: resample → log-mel spectrogram → ONNX inference → dispose tensors.
+ *
+ * @param {number[]} rawSamples   PCM samples as a plain Array (transferred from content.js)
+ * @param {number}   srcRate      Sample rate of `rawSamples` (e.g. 44100, 48000)
+ * @param {number}   targetTabId
+ */
+async function processAudioChunk(rawSamples, srcRate, targetTabId) {
+    let inputTensor  = null;
+    let outputMap    = null;
+
+    try {
+        if (!audioSession) {
+            console.warn('[offscreen] Audio session not ready; attempting to initialize now.');
+            await initializeAudioSession();
+            if (!audioSession) {
+                console.warn('[offscreen] Audio model unavailable — skipping audio inference.');
+                return;
+            }
+        }
+
+        // 1. Convert plain Array → Float32Array and resample to 16kHz.
+        const pcmF32    = new Float32Array(rawSamples);
+        const pcm16k    = resample(pcmF32, srcRate, AUDIO_SAMPLE_RATE);
+
+        // 2. Compute log-mel spectrogram  → Float32Array of length MEL_BINS × MEL_FRAMES
+        const specData  = computeLogMelSpectrogram(pcm16k);
+
+        // 3. Wrap in ONNX tensor [batch=1, channels=1, mel=128, frames=128]
+        inputTensor = new ort.Tensor('float32', specData, [1, 1, MEL_BINS, MEL_FRAMES]);
+
+        const inputName  = audioSession.inputNames[0]  ?? 'input';
+        outputMap        = await audioSession.run({ [inputName]: inputTensor });
+
+        const outputName = audioSession.outputNames[0] ?? Object.keys(outputMap)[0];
+        const audioScore = extractConfidence(outputMap[outputName]);
+
+        // 4. Send result back to background.
+        chrome.runtime.sendMessage({
+            type:          'AUDIO_INFERENCE_RESULT',
+            audioConfidence: audioScore,
+            targetTabId
+        });
+
+        console.log('[offscreen] Audio inference complete. Score:', audioScore);
+    } catch (err) {
+        console.error('[offscreen] Error during audio processing:', err);
+    } finally {
+        // Dispose WASM memory — MUST mirror the video pipeline's finally block.
+        try {
+            if (inputTensor && typeof inputTensor.dispose === 'function') inputTensor.dispose();
+            if (outputMap) {
+                for (const key of Object.keys(outputMap)) {
+                    const t = outputMap[key];
+                    if (t && typeof t.dispose === 'function') t.dispose();
+                }
+            }
+        } catch (disposeErr) {
+            console.error('[offscreen] Error disposing audio tensors:', disposeErr);
+        }
+    }
+}
