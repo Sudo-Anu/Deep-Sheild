@@ -602,4 +602,13 @@ Every star helps the project get more visibility and motivates further developme
 
 ---
 
+## Usage and Screenshots -
+<img width="1917" height="1078" alt="Screenshot 2026-09-01 231302" src="https://github.com/user-attachments/assets/9673e7db-c1c3-4b5f-b768-cacf3b31208b" />
+<img width="1917" height="1078" alt="Screenshot 2026-09-01 232044" src="https://github.com/user-attachments/assets/355f12a3-315e-4a56-87ae-9883db61b4f4" />
+<img width="311" height="442" alt="Screenshot 2026-09-01 231313" src="https://github.com/user-attachments/assets/596a17e8-57b6-48d7-b008-c92cc73befb2" />
+<img width="312" height="443" alt="Screenshot 2026-09-01 232055" src="https://github.com/user-attachments/assets/aab171d0-a24a-49dc-b6ac-7a626af64852" />
+<img width="51" height="108" alt="Screenshot 2026-09-01 231320" src="https://github.com/user-attachments/assets/8736c24f-ef06-40f8-a0f7-68ee8e08df6e" />
+
+
+
 > **DeepShield — Detect deepfakes locally. Keep your media private.**
