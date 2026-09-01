@@ -2,7 +2,7 @@
 
 ### Privacy-First, On-Device Deepfake Detection for the Web
 
-**DeepShield** is a Chrome extension designed to detect **AI-generated and manipulated video and audio directly on the user's device** — without requiring API keys, cloud inference, or uploading media to an external server.
+**DeepShield** is a Chrome extension designed to detect **AI-generated and manipulated video and audio directly on the user's device** without requiring API keys, cloud inference, or uploading media to an external server.
 
 The project focuses on one simple idea:
 
